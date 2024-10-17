@@ -37,7 +37,8 @@ gcc --version
 
 # TODOs
 
-- [ ] Reproduce the original modded-nanogpt demo
+- [x] Reproduce the original modded-nanogpt demo
+- [ ] Set up config to be Hydra-compatible
 - [ ] Reproduce the original modded-nanogpt with UniRef data
   - [ ] Download scripts for UniRef 100 and 50
     - [ ] Splits for train/val/test

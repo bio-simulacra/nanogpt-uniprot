@@ -22,264 +22,23 @@ See the Hyperparameters class for configurable options.
 
 import os
 import sys
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List
 
 import tqdm
 
 with open(sys.argv[0]) as f:
     code = f.read()  # read the code of this file ASAP, for logging
-import glob
 import time
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from nanogpt_uniprot.networks.gpt2 import GPT, GPTConfig
-
-# -----------------------------------------------------------------------------
-# Muon optimizer
-
-
-def zeropower_via_svd(G: torch.Tensor, steps: Optional[int] = None) -> torch.Tensor:
-    U, S, V = G.svd()
-    return U @ V.T
-
-
-@torch.compile
-def zeropower_via_newtonschulz5(
-    G: torch.Tensor, steps: int = 10, eps: float = 1e-7
-) -> torch.Tensor:
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
-    assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
-    X /= X.norm() + eps  # ensure top singular value <= 1
-    if G.size(0) > G.size(1):
-        X = X.T
-    for _ in range(steps):
-        A = X @ X.T
-        B = A @ X
-        X = a * X + b * B + c * A @ B
-    if G.size(0) > G.size(1):
-        X = X.T
-    return X
-
-
-zeropower_backends: Dict[str, Any] = dict(
-    svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5
-)
-
-
-class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Some warnings:
-    - This optimizer assumes that all parameters passed in are 2D.
-    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
-    parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
-    - We believe it is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
-    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
-
-    Arguments:
-        lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
-        backend_steps: The number of iteration steps to use in the backend, if it is iterative.
-    """
-
-    def __init__(
-        self,
-        params: List[torch.Tensor],
-        lr: float = 3e-4,
-        momentum: float = 0.95,
-        nesterov: bool = True,
-        backend: str = "newtonschulz5",
-        backend_steps: int = 5,
-        rank: int = 0,
-        world_size: int = 1,
-    ):
-        defaults = dict(
-            lr=lr,
-            momentum=momentum,
-            nesterov=nesterov,
-            backend=backend,
-            backend_steps=backend_steps,
-        )
-        super().__init__(params, defaults)
-        self.rank = rank
-        self.world_size = world_size
-
-    def step(self) -> None:
-        for group in self.param_groups:
-            lr = group["lr"]
-            momentum = group["momentum"]
-            zeropower_backend = zeropower_backends[group["backend"]]
-
-            # generate weight updates in distributed fashion
-            total_params = sum(p.numel() for p in group["params"])
-            updates_flat = torch.zeros(
-                total_params, device="cuda", dtype=torch.bfloat16
-            )
-            curr_idx = 0
-            for i, p in enumerate(group["params"]):
-                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
-                if i % self.world_size == self.rank:
-                    g = p.grad
-                    if g is None:
-                        continue
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if group["nesterov"]:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_backend(g, steps=group["backend_steps"])
-                    g *= (
-                        max(g.size(0), g.size(1)) ** 0.5
-                    )  # scale to have update.square().mean() == 1
-                    updates_flat[curr_idx : curr_idx + p.numel()] = g.flatten()
-                curr_idx += p.numel()
-
-            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
-            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-
-            # deserialize and apply updates
-            curr_idx = 0
-            for p in group["params"]:
-                g = (
-                    updates_flat[curr_idx : curr_idx + p.numel()]
-                    .view_as(p.data)
-                    .type_as(p.data)
-                )
-                p.data.add_(g, alpha=-lr)
-                curr_idx += p.numel()
-
-
-# -----------------------------------------------------------------------------
-# Our own simple Distributed Data Loader
-
-
-def _peek_data_shard(filename: str) -> int:
-    # only reads the header, returns header data
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
-    if header[0] != 20240520:
-        print("ERROR: magic number mismatch in the data .bin file!")
-        print("---> HINT: Are you passing in a correct file with --input_bin?")
-        print(
-            "---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README"
-        )
-        print(
-            "---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try"
-        )
-        exit(1)
-    assert header[1] == 1, "unsupported version"
-    ntok = header[2]  # number of tokens (claimed)
-    return ntok  # for now just return the number of tokens
-
-
-def _load_data_shard(filename: str) -> np.ndarray:
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
-        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-        assert header[1] == 1, "unsupported version"
-        ntok = header[2]  # number of tokens (claimed)
-        # the rest of it are tokens, stored as uint16
-        tokens = np.frombuffer(f.read(), dtype=np.uint16)
-    assert len(tokens) == ntok, "number of tokens read does not match header?"
-    return tokens
-
-
-class DistributedDataLoader:
-    def __init__(
-        self,
-        filename_pattern: str,
-        B: int,
-        T: int,
-        process_rank: int,
-        num_processes: int,
-    ):
-        """
-        Initialize the DistributedDataLoader.
-
-        Args:
-            filename_pattern (str): Pattern to match data files.
-            B (int): Batch size.
-            T (int): Sequence length.
-            process_rank (int): Rank of the current process.
-            num_processes (int): Total number of processes.
-
-        This loader distributes data across multiple processes for parallel training.
-        It loads data shards, manages their distribution, and provides batches of data.
-        """
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        self.B = B
-        self.T = T
-
-        # glob files that match the pattern
-        self.files = sorted(glob.glob(filename_pattern))
-        assert (
-            len(self.files) > 0
-        ), f"did not find any files that match the pattern {filename_pattern}"
-
-        # load and validate all data shards, count number of tokens in total
-        ntok_total = 0
-        for fname in self.files:
-            shard_ntok = _peek_data_shard(fname)
-            assert shard_ntok >= num_processes * B * T + 1
-            ntok_total += int(shard_ntok)
-        self.ntok_total = ntok_total
-
-        # kick things off
-        self.reset()
-
-    def reset(self) -> None:
-        self.current_shard = 0
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
-
-    def advance(self) -> None:  # advance to next data shard
-        self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
-
-    def next_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        B = self.B
-        T = self.T
-        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = (buf[:-1]).view(B, T)  # inputs
-        y = (buf[1:]).view(B, T)  # targets
-        # advance current position and load next shard if necessary
-        self.current_position += B * T * self.num_processes
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.advance()
-        return x.cuda(), y.cuda()
+from nanogpt_uniprot.nn.gpt2 import GPT, GPTConfig
+from nanogpt_uniprot.optim import Muon
+from nanogpt_uniprot.utils.data import DistributedDataLoader
 
 
 # TODO: Convert to hydra config
@@ -452,9 +211,10 @@ def main():
             for _ in tqdm.tqdm(range(val_steps), desc="Validation"):
                 x_val, y_val = val_loader.next_batch()
                 with ctx:  # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
-                    _, loss = model(x_val, y_val, return_logits=False)
-                    val_loss += loss.detach()
-                    del loss
+                    with torch.no_grad():
+                        _, loss = model(x_val, y_val, return_logits=False)
+                        val_loss += loss.detach()
+                        del loss
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
             val_loss /= val_steps
             # log val loss to console and to logfile
@@ -510,12 +270,14 @@ def main():
                     loss.backward()
             else:
                 loss.backward()  # just sync on the last step
+
         for p in model.parameters():
             p.grad /= train_accumulation_steps
         # step the optimizers and schedulers
         for opt, sched in zip(optimizers, schedulers):
             opt.step()
             sched.step()
+
         # null the gradients
         model.zero_grad(set_to_none=True)
         # --------------- TRAINING SECTION END -------------------
