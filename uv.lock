@@ -283,6 +283,12 @@ wheels = [
 ]
 
 [[package]]
+name = "hydra"
+version = "2.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6e/ac/7a7596cb752fe807be2f6fa11ed561e39efa86f556214733fc7df0e985d9/Hydra-2.5.tar.gz", hash = "sha256:247091b9c279c77686ea995f0f07070a28870c1942959b1474ad57076074384a", size = 82417 }
+
+[[package]]
 name = "idna"
 version = "3.10"
 source = { registry = "https://pypi.org/simple" }
@@ -437,6 +443,7 @@ source = { editable = "." }
 dependencies = [
     { name = "datasets" },
     { name = "huggingface-hub" },
+    { name = "hydra" },
     { name = "numpy" },
     { name = "ruff" },
     { name = "tiktoken" },
@@ -448,6 +455,7 @@ dependencies = [
 requires-dist = [
     { name = "datasets", specifier = ">=3.0.1" },
     { name = "huggingface-hub", specifier = ">=0.25.2" },
+    { name = "hydra", specifier = ">=2.5" },
     { name = "numpy", specifier = ">=2.1.2" },
     { name = "ruff", specifier = ">=0.7.0" },
     { name = "tiktoken", specifier = ">=0.8.0" },

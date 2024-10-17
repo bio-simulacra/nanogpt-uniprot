@@ -9,8 +9,5 @@ wheels/
 # Virtual environments
 .venv
 
-# Ignore subfolders in src/nanogpt_uniprot/data/
-src/nanogpt_uniprot/data/*/
-
-# But don't ignore the data directory itself
-!src/nanogpt_uniprot/data/
+# ignore the data directory
+data/
