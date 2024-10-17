@@ -1,0 +1,12 @@
+[project]
+name = "nanogpt-uniprot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [{ name = "Gregory Johnson", email = "gregjohnso@gmail.com" }]
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
