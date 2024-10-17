@@ -2,7 +2,7 @@
 
 This is a simple implementation of NanoGPT for Uniprot.
 
-This is largely borrowed from [Keller Jordan's modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt/tree/master), and we thank him for releasing his code.
+This is largely borrowed from [Keller Jordan's modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt/tree/master), and we thank him for sharing his code.
 
 
 # Highlights
@@ -19,7 +19,7 @@ To execute the training, run the following commands.
 
 ```
 uv run src/nanogpt_uniprot/data/cached_fineweb10B.py
-uv run src/nanogpt_uniprot/train_gpt2.py
+bash run.sh
 ```
 
 ## Prerequesites

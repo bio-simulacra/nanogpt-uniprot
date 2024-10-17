@@ -13,4 +13,4 @@ else
 fi
 
 # Run the torchrun command with the specified or default number of processors
-torchrun --standalone --nproc_per_node=$NPROC src/nanogpt_uniprot/train_gpt2.py
+torchrun --standalone --nproc_per_node=$NPROC src/nanogpt_uniprot/train.py
