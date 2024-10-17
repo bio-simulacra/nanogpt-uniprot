@@ -5,10 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 authors = [{ name = "Gregory Johnson", email = "gregjohnso@gmail.com" }]
 requires-python = ">=3.11"
-dependencies = [
-    "numpy>=2.1.2",
-    "torch>=2.5.0",
-]
+dependencies = ["numpy>=2.1.2", "ruff>=0.7.0", "torch>=2.5.0"]
 
 [build-system]
 requires = ["hatchling"]
